@@ -7,6 +7,7 @@ from geometry_msgs.msg import PoseStamped
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Empty, Int32, String
 
 from pymycobot.mycobot280 import MyCobot280
 
@@ -31,8 +32,14 @@ class MyCobotJointStateController(Node):
         self.declare_parameter('joint_names', ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6'])
         self.declare_parameter('joint_angle_min_deg', [-165.0, -135.0, -150.0, -145.0, -165.0, -180.0])
         self.declare_parameter('joint_angle_max_deg', [165.0, 135.0, 150.0, 145.0, 165.0, 180.0])
-        self.declare_parameter('send_only_on_change', True)
+        self.declare_parameter('send_only_on_change', False)
         self.declare_parameter('change_threshold_deg', 0.5)
+        self.declare_parameter('gripper_command_topic', '/mycobot/gripper/command')
+        self.declare_parameter('gripper_value_topic', '/mycobot/gripper/value')
+        self.declare_parameter('gripper_calibration_topic', '/mycobot/gripper/calibrate')
+        self.declare_parameter('gripper_speed', 30)
+        self.declare_parameter('gripper_value_min', 0)
+        self.declare_parameter('gripper_value_max', 100)
 
         self._port = str(self.get_parameter('port').value)
         self._baud = int(self.get_parameter('baud').value)
@@ -52,6 +59,12 @@ class MyCobotJointStateController(Node):
         self._joint_angle_max_deg = [float(v) for v in self.get_parameter('joint_angle_max_deg').value]
         self._send_only_on_change = bool(self.get_parameter('send_only_on_change').value)
         self._change_threshold_deg = float(self.get_parameter('change_threshold_deg').value)
+        self._gripper_command_topic = str(self.get_parameter('gripper_command_topic').value)
+        self._gripper_value_topic = str(self.get_parameter('gripper_value_topic').value)
+        self._gripper_calibration_topic = str(self.get_parameter('gripper_calibration_topic').value)
+        self._gripper_speed = int(self.get_parameter('gripper_speed').value)
+        self._gripper_value_min = int(self.get_parameter('gripper_value_min').value)
+        self._gripper_value_max = int(self.get_parameter('gripper_value_max').value)
 
         if len(self._joint_names) != 6:
             raise ValueError('joint_names must contain exactly 6 names.')
@@ -59,6 +72,8 @@ class MyCobotJointStateController(Node):
             raise ValueError('joint_angle_min_deg and joint_angle_max_deg must contain exactly 6 values.')
         if self._position_unit not in ('rad', 'deg'):
             raise ValueError("position_unit must be either 'rad' or 'deg'.")
+        if self._gripper_value_min >= self._gripper_value_max:
+            raise ValueError('gripper_value_min must be smaller than gripper_value_max.')
 
         self._joint_index_by_name: Dict[str, int] = {
             name: idx for idx, name in enumerate(self._joint_names)
@@ -76,6 +91,24 @@ class MyCobotJointStateController(Node):
             self._on_joint_state,
             self._queue_size,
         )
+        self._gripper_command_sub = self.create_subscription(
+            String,
+            self._gripper_command_topic,
+            self._on_gripper_command,
+            self._queue_size,
+        )
+        self._gripper_value_sub = self.create_subscription(
+            Int32,
+            self._gripper_value_topic,
+            self._on_gripper_value,
+            self._queue_size,
+        )
+        self._gripper_calibration_sub = self.create_subscription(
+            Empty,
+            self._gripper_calibration_topic,
+            self._on_gripper_calibration,
+            self._queue_size,
+        )
 
         self._joint_state_pub = self.create_publisher(JointState, self._state_topic, self._queue_size)
         self._ee_pose_pub = self.create_publisher(PoseStamped, self._ee_pose_topic, self._queue_size)
@@ -88,6 +121,9 @@ class MyCobotJointStateController(Node):
         self.get_logger().info(
             f'myCobot JointState controller started: command_topic={self._command_topic}, '
             f'state_topic={self._state_topic}, ee_pose_topic={self._ee_pose_topic}, '
+            f'gripper_command_topic={self._gripper_command_topic}, '
+            f'gripper_value_topic={self._gripper_value_topic}, '
+            f'gripper_calibration_topic={self._gripper_calibration_topic}, '
             f'port={self._port}, baud={self._baud}, unit={self._position_unit}'
         )
 
@@ -170,6 +206,50 @@ class MyCobotJointStateController(Node):
             self._last_sent_angles_deg = target
         except Exception as exc:  # pylint: disable=broad-except
             self.get_logger().error(f'Failed to send command to myCobot: {exc}')
+
+    def _on_gripper_command(self, msg: String) -> None:
+        cmd = msg.data.strip().lower()
+        if not cmd:
+            return
+
+        try:
+            if cmd in ('open', 'release'):
+                self._mc.set_gripper_state(0, self._gripper_speed)
+                self.get_logger().info('Gripper command: open')
+            elif cmd in ('close', 'grasp'):
+                self._mc.set_gripper_state(1, self._gripper_speed)
+                self.get_logger().info('Gripper command: close')
+            elif cmd in ('calibrate', 'calibration'):
+                self._mc.set_gripper_calibration()
+                self.get_logger().info('Gripper command: calibration')
+            elif cmd == 'init':
+                self._mc.init_gripper()
+                self.get_logger().info('Gripper command: init')
+            elif cmd == 'stop':
+                self._mc.gripper_stop()
+                self.get_logger().info('Gripper command: stop')
+            else:
+                self.get_logger().warning(
+                    'Unknown gripper command. Use open/close/calibrate/init/stop.'
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            self.get_logger().error(f'Failed to run gripper command "{cmd}": {exc}')
+
+    def _on_gripper_value(self, msg: Int32) -> None:
+        value = int(msg.data)
+        value = max(self._gripper_value_min, min(self._gripper_value_max, value))
+        try:
+            self._mc.set_gripper_value(value, self._gripper_speed)
+            self.get_logger().info(f'Gripper value command: {value}')
+        except Exception as exc:  # pylint: disable=broad-except
+            self.get_logger().error(f'Failed to set gripper value {value}: {exc}')
+
+    def _on_gripper_calibration(self, _msg: Empty) -> None:
+        try:
+            self._mc.set_gripper_calibration()
+            self.get_logger().info('Gripper calibration command received')
+        except Exception as exc:  # pylint: disable=broad-except
+            self.get_logger().error(f'Failed to calibrate gripper: {exc}')
 
     def _publish_robot_state(self) -> None:
         now = self.get_clock().now().to_msg()
