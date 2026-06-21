@@ -30,6 +30,7 @@ class MyCobotJointStateController(Node):
         self.declare_parameter('ee_frame_id', 'mycobot_ee')
         self.declare_parameter('queue_size', 10)
         self.declare_parameter('command_speed', 30)
+        self.declare_parameter('fresh_mode', 1)
         self.declare_parameter('command_rate_hz', 30.0)
         self.declare_parameter('position_unit', 'rad')
         self.declare_parameter('joint_names', ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6'])
@@ -46,6 +47,8 @@ class MyCobotJointStateController(Node):
         self.declare_parameter('profile_io_timing', False)
         self.declare_parameter('io_timing_log_every_n', 120)
         self.declare_parameter('io_timing_outlier_ms', 20.0)
+        self.declare_parameter('clear_queue_on_send_outlier_ms', 0.0)
+        self.declare_parameter('clear_queue_cooldown_sec', 1.0)
 
         self._port = str(self.get_parameter('port').value)
         self._baud = int(self.get_parameter('baud').value)
@@ -61,6 +64,7 @@ class MyCobotJointStateController(Node):
         self._ee_frame_id = str(self.get_parameter('ee_frame_id').value)
         self._queue_size = int(self.get_parameter('queue_size').value)
         self._command_speed = int(self.get_parameter('command_speed').value)
+        self._fresh_mode = int(self.get_parameter('fresh_mode').value)
         self._command_rate_hz = float(self.get_parameter('command_rate_hz').value)
         self._position_unit = str(self.get_parameter('position_unit').value).strip().lower()
         self._joint_names = list(self.get_parameter('joint_names').value)
@@ -77,6 +81,8 @@ class MyCobotJointStateController(Node):
         self._profile_io_timing = bool(self.get_parameter('profile_io_timing').value)
         self._io_timing_log_every_n = int(self.get_parameter('io_timing_log_every_n').value)
         self._io_timing_outlier_ms = float(self.get_parameter('io_timing_outlier_ms').value)
+        self._clear_queue_on_send_outlier_ms = float(self.get_parameter('clear_queue_on_send_outlier_ms').value)
+        self._clear_queue_cooldown_sec = float(self.get_parameter('clear_queue_cooldown_sec').value)
 
         if len(self._joint_names) != 6:
             raise ValueError('joint_names must contain exactly 6 names.')
@@ -84,6 +90,8 @@ class MyCobotJointStateController(Node):
             raise ValueError('joint_angle_min_deg and joint_angle_max_deg must contain exactly 6 values.')
         if self._position_unit not in ('rad', 'deg'):
             raise ValueError("position_unit must be either 'rad' or 'deg'.")
+        if self._fresh_mode not in (0, 1):
+            raise ValueError('fresh_mode must be 0 or 1.')
         if self._joint_state_source not in ('device', 'command_echo'):
             raise ValueError("joint_state_source must be either 'device' or 'command_echo'.")
         if self._gripper_value_min >= self._gripper_value_max:
@@ -92,6 +100,10 @@ class MyCobotJointStateController(Node):
             raise ValueError('io_timing_log_every_n must be greater than 0.')
         if self._io_timing_outlier_ms < 0.0:
             raise ValueError('io_timing_outlier_ms must be >= 0.0.')
+        if self._clear_queue_on_send_outlier_ms < 0.0:
+            raise ValueError('clear_queue_on_send_outlier_ms must be >= 0.0.')
+        if self._clear_queue_cooldown_sec < 0.0:
+            raise ValueError('clear_queue_cooldown_sec must be >= 0.0.')
 
         self._joint_index_by_name: Dict[str, int] = {
             name: idx for idx, name in enumerate(self._joint_names)
@@ -105,6 +117,7 @@ class MyCobotJointStateController(Node):
         self._last_sent_angles_deg: Optional[List[float]] = None
         self._command_min_interval_sec = 1.0 / max(self._command_rate_hz, 0.1)
         self._last_send_monotonic = 0.0
+        self._last_queue_clear_monotonic = 0.0
         self._io_timing = {
             'send_angles': {'count': 0, 'sum_ms': 0.0, 'min_ms': float('inf'), 'max_ms': 0.0},
             'get_angles': {'count': 0, 'sum_ms': 0.0, 'min_ms': float('inf'), 'max_ms': 0.0},
@@ -157,13 +170,16 @@ class MyCobotJointStateController(Node):
             f'gripper_value_topic={self._gripper_value_topic}, '
             f'gripper_calibration_topic={self._gripper_calibration_topic}, '
             f'port={self._port}, baud={self._baud}, unit={self._position_unit}, '
+            f'fresh_mode={self._fresh_mode}, '
             f'command_rate_hz={self._command_rate_hz}, '
             f'joint_state_publish_rate_hz={self._state_publish_rate_hz}, '
             f'ee_pose_publish_rate_hz={self._ee_pose_publish_rate_hz}, '
             f'enable_ee_pose_publish={self._enable_ee_pose_publish}, '
             f'profile_io_timing={self._profile_io_timing}, '
             f'io_timing_log_every_n={self._io_timing_log_every_n}, '
-            f'io_timing_outlier_ms={self._io_timing_outlier_ms}'
+            f'io_timing_outlier_ms={self._io_timing_outlier_ms}, '
+            f'clear_queue_on_send_outlier_ms={self._clear_queue_on_send_outlier_ms}, '
+            f'clear_queue_cooldown_sec={self._clear_queue_cooldown_sec}'
         )
 
     def _record_io_timing(self, name: str, elapsed_ms: float) -> None:
@@ -197,8 +213,13 @@ class MyCobotJointStateController(Node):
         self._safe_init_call('power_on', mc.power_on)
         self._safe_init_call('resume', mc.resume)
         self._safe_init_call('clear_queue', mc.clear_queue)
+        self._safe_init_call(
+            f'set_fresh_mode({self._fresh_mode})',
+            lambda: mc.set_fresh_mode(self._fresh_mode)
+        )
         self._safe_init_call('set_free_mode(0)', lambda: mc.set_free_mode(0))
         self._safe_init_call('focus_all_servos', mc.focus_all_servos)
+        self._safe_init_call('get_fresh_mode', lambda: self.get_logger().info(f'Robot fresh_mode={mc.get_fresh_mode()}'))
         time.sleep(0.5)
 
         return mc
@@ -284,12 +305,35 @@ class MyCobotJointStateController(Node):
             t0 = time.perf_counter() if self._profile_io_timing else None
             with self._mc_lock:
                 self._mc.send_angles(target, self._command_speed)
-            if t0 is not None:
-                self._record_io_timing('send_angles', (time.perf_counter() - t0) * 1000.0)
+                if t0 is not None:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                    self._record_io_timing('send_angles', elapsed_ms)
+                    self._maybe_clear_queue_after_send_outlier(elapsed_ms)
+                else:
+                    elapsed_ms = None
             self._last_sent_angles_deg = target
             self._last_send_monotonic = now_mono
         except Exception as exc:  # pylint: disable=broad-except
             self.get_logger().error(f'Failed to send command to myCobot: {exc}')
+
+    def _maybe_clear_queue_after_send_outlier(self, elapsed_ms: float) -> None:
+        if self._clear_queue_on_send_outlier_ms <= 0.0:
+            return
+        if elapsed_ms < self._clear_queue_on_send_outlier_ms:
+            return
+
+        now_mono = time.monotonic()
+        if (now_mono - self._last_queue_clear_monotonic) < self._clear_queue_cooldown_sec:
+            return
+
+        try:
+            self._mc.clear_queue()
+            self._last_queue_clear_monotonic = now_mono
+            self.get_logger().warning(
+                f'clear_queue executed after send_angles outlier {elapsed_ms:.2f} ms'
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            self.get_logger().warning(f'clear_queue after outlier failed: {exc}')
 
     def _command_worker(self) -> None:
         while self._running:
