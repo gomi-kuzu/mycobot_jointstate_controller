@@ -49,6 +49,10 @@ class MyCobotJointStateController(Node):
         self.declare_parameter('io_timing_outlier_ms', 20.0)
         self.declare_parameter('clear_queue_on_send_outlier_ms', 0.0)
         self.declare_parameter('clear_queue_cooldown_sec', 1.0)
+        self.declare_parameter('move_to_initial_pose', True)
+        self.declare_parameter('initial_pose_deg', '0.0,50.0,-128.0,38.0,-4.0,0.0')
+        self.declare_parameter('initial_pose_max_distance', 140.0)
+        self.declare_parameter('initial_pose_speed', 30)
 
         self._port = str(self.get_parameter('port').value)
         self._baud = int(self.get_parameter('baud').value)
@@ -83,6 +87,11 @@ class MyCobotJointStateController(Node):
         self._io_timing_outlier_ms = float(self.get_parameter('io_timing_outlier_ms').value)
         self._clear_queue_on_send_outlier_ms = float(self.get_parameter('clear_queue_on_send_outlier_ms').value)
         self._clear_queue_cooldown_sec = float(self.get_parameter('clear_queue_cooldown_sec').value)
+        self._move_to_initial_pose = bool(self.get_parameter('move_to_initial_pose').value)
+        initial_pose_str = str(self.get_parameter('initial_pose_deg').value)
+        self._initial_pose_deg = [float(v.strip()) for v in initial_pose_str.split(',')]
+        self._initial_pose_max_distance = float(self.get_parameter('initial_pose_max_distance').value)
+        self._initial_pose_speed = int(self.get_parameter('initial_pose_speed').value)
 
         if len(self._joint_names) != 6:
             raise ValueError('joint_names must contain exactly 6 names.')
@@ -104,6 +113,12 @@ class MyCobotJointStateController(Node):
             raise ValueError('clear_queue_on_send_outlier_ms must be >= 0.0.')
         if self._clear_queue_cooldown_sec < 0.0:
             raise ValueError('clear_queue_cooldown_sec must be >= 0.0.')
+        if len(self._initial_pose_deg) != 6:
+            raise ValueError('initial_pose_deg must contain exactly 6 values.')
+        if self._initial_pose_max_distance < 0.0:
+            raise ValueError('initial_pose_max_distance must be >= 0.0.')
+        if self._initial_pose_speed <= 0:
+            raise ValueError('initial_pose_speed must be > 0.')
 
         self._joint_index_by_name: Dict[str, int] = {
             name: idx for idx, name in enumerate(self._joint_names)
@@ -126,6 +141,7 @@ class MyCobotJointStateController(Node):
 
         self._mc = self._connect_mycobot()
         self._seed_last_sent_from_robot()
+        self._move_to_initial_pose_if_enabled()
 
         self._sub = self.create_subscription(
             JointState,
@@ -179,7 +195,11 @@ class MyCobotJointStateController(Node):
             f'io_timing_log_every_n={self._io_timing_log_every_n}, '
             f'io_timing_outlier_ms={self._io_timing_outlier_ms}, '
             f'clear_queue_on_send_outlier_ms={self._clear_queue_on_send_outlier_ms}, '
-            f'clear_queue_cooldown_sec={self._clear_queue_cooldown_sec}'
+            f'clear_queue_cooldown_sec={self._clear_queue_cooldown_sec}, '
+            f'move_to_initial_pose={self._move_to_initial_pose}, '
+            f'initial_pose_deg={self._initial_pose_deg}, '
+            f'initial_pose_max_distance={self._initial_pose_max_distance}, '
+            f'initial_pose_speed={self._initial_pose_speed}'
         )
 
     def _record_io_timing(self, name: str, elapsed_ms: float) -> None:
@@ -239,6 +259,74 @@ class MyCobotJointStateController(Node):
                 self._last_sent_angles_deg = [float(v) for v in angles_deg[:6]]
         except Exception as exc:  # pylint: disable=broad-except
             self.get_logger().warning(f'Initial get_angles failed: {exc}')
+
+    def _move_to_initial_pose_if_enabled(self) -> None:
+        """Move to initial pose if enabled, after checking error threshold."""
+        if not self._move_to_initial_pose:
+            self.get_logger().info('Initial pose movement is disabled.')
+            return
+
+        try:
+            # Get current robot angles
+            with self._mc_lock:
+                current_angles_deg = self._mc.get_angles()
+            
+            if not current_angles_deg or len(current_angles_deg) < 6:
+                self.get_logger().warning(
+                    'Failed to get current angles for initial pose check. '
+                    'Skipping initial pose movement.'
+                )
+                return
+            
+            current = [float(v) for v in current_angles_deg[:6]]
+            target = self._initial_pose_deg
+            
+            # Calculate L2 norm of the error
+            error_vec = [t - c for t, c in zip(target, current)]
+            error_norm = math.sqrt(sum(e * e for e in error_vec))
+            
+            self.get_logger().info(
+                f'Initial pose check: current={[f"{v:.2f}" for v in current]}, '
+                f'target={[f"{v:.2f}" for v in target]}, '
+                f'distance={error_norm:.2f}'
+            )
+            
+            # Check if error is within threshold
+            if error_norm > self._initial_pose_max_distance:
+                self.get_logger().warning(
+                    f'Initial pose distance ({error_norm:.2f}) exceeds maximum allowed '
+                    f'({self._initial_pose_max_distance:.2f}). '
+                    f'Skipping initial pose movement for safety. '
+                    f'Controller will start from current position. '
+                    f'Please manually move the robot closer to the target pose or '
+                    f'increase initial_pose_max_distance parameter.'
+                )
+                return
+            
+            # Move to initial pose
+            self.get_logger().info(
+                f'Moving to initial pose {target} at speed {self._initial_pose_speed}...'
+            )
+            with self._mc_lock:
+                self._mc.send_angles(target, self._initial_pose_speed)
+            
+            # Wait for movement to complete (approximate)
+            # Calculate approximate time based on max joint movement and speed
+            max_delta = max(abs(e) for e in error_vec)
+            wait_time = max(2.0, max_delta / self._initial_pose_speed * 1.5)  # 1.5x safety margin
+            self.get_logger().info(f'Waiting {wait_time:.1f}s for movement to complete...')
+            time.sleep(wait_time)
+            
+            # Update last sent angles
+            self._last_sent_angles_deg = list(target)
+            
+            self.get_logger().info('Initial pose movement completed successfully.')
+            
+        except Exception as exc:  # pylint: disable=broad-except
+            self.get_logger().warning(
+                f'Failed to move to initial pose: {exc}. '
+                f'Skipping initial pose movement. Controller will start from current position.'
+            )
 
     def _on_joint_state(self, msg: JointState) -> None:
         if not msg.position:

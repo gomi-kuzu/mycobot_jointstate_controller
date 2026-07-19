@@ -23,15 +23,7 @@ source install/setup.bash
 ## 起動
 
 ```bash
-ros2 launch mycobot_jointstate_controller mycobot_jointstate_controller.launch.py \
-  port:=/dev/ttyUSB0 \
-  command_topic:=/mycobot/joint_commands \
-  state_topic:=/mycobot/joint_states \
-  ee_pose_topic:=/mycobot/ee_pose \
-  gripper_command_topic:=/mycobot/gripper/command \
-  gripper_value_topic:=/mycobot/gripper/value \
-  gripper_calibration_topic:=/mycobot/gripper/calibrate \
-  position_unit:=rad
+ros2 launch mycobot_jointstate_controller mycobot_jointstate_controller.launch.py
 ```
 
 ## グリッパ操作例
@@ -78,6 +70,50 @@ ros2 topic pub --once /mycobot/gripper/calibrate std_msgs/msg/Empty "{}"
 - `change_threshold_deg` (float): 変化量しきい値（度）（既定値: `0.8`）
 - `clear_queue_on_send_outlier_ms` (float): `send_angles()` がこのms以上かかったら `clear_queue()` を実行（既定値: `400.0`）
 - `clear_queue_cooldown_sec` (float): 連続 `clear_queue()` の最小間隔秒（既定値: `1.0`）
+- `move_to_initial_pose` (bool): 起動時に初期姿勢へ移動（既定値: `true`）
+- `initial_pose_deg` (string): 初期姿勢の関節角度[deg]（カンマ区切り、6要素）（既定値: `0.0,50.0,-128.0,38.0,-4.0,0.0`）
+- `initial_pose_max_distance` (float): 初期姿勢との許容最大距離（6次元関節空間でのL2ノルム）（既定値: `140.0`）
+- `initial_pose_speed` (int): 初期姿勢への移動速度（既定値: `30`）
+
+
+## 初期姿勢移動機能
+
+起動時にロボットを指定した初期姿勢に自動的に移動させることができます。この機能により、毎回同じ姿勢から操作を開始できます。
+
+### 使用方法
+
+デフォルトで初期姿勢移動が有効です。無効にしたい場合：
+
+```bash
+ros2 launch mycobot_jointstate_controller mycobot_jointstate_controller.launch.py \
+  move_to_initial_pose:=false
+```
+
+カスタム初期姿勢を指定する場合：
+
+```bash
+ros2 launch mycobot_jointstate_controller mycobot_jointstate_controller.launch.py \
+  initial_pose_deg:="0.0,45.0,-90.0,45.0,0.0,0.0"
+```
+
+### パラメータ詳細
+
+- `move_to_initial_pose`: 初期姿勢移動を有効化します（既定値: `true`）
+- `initial_pose_deg`: 目標とする初期姿勢を6軸の角度（度）でカンマ区切りで指定します
+- `initial_pose_max_distance`: 現在姿勢と目標姿勢の距離（6次元関節空間でのL2ノルム）の許容最大値です。この値を超える場合、安全のため初期姿勢移動をスキップします
+- `initial_pose_speed`: 初期姿勢への移動速度を指定します（0-100）
+
+### 安全機能
+
+起動時に現在のロボット姿勢を読み取り、目標初期姿勢との距離を6次元関節空間でのL2ノルムで計算します。距離が `initial_pose_max_distance` を超える場合、以下の警告メッセージを表示して初期姿勢移動をスキップし、現在位置からコントローラを起動します：
+
+```
+Initial pose distance (XX.XX) exceeds maximum allowed (50.00).
+Skipping initial pose movement for safety.
+Controller will start from current position.
+```
+
+この機能により、ロボットが予期せず大きく動くことを防ぎます。より大きな移動を許可したい場合は `initial_pose_max_distance` パラメータを増やしてください。
 
 
 ## 注意事項

@@ -30,6 +30,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('io_timing_outlier_ms', default_value='20.0'),
         DeclareLaunchArgument('clear_queue_on_send_outlier_ms', default_value='400.0'),
         DeclareLaunchArgument('clear_queue_cooldown_sec', default_value='1.0'),
+        DeclareLaunchArgument('move_to_initial_pose', default_value='true'),
+        DeclareLaunchArgument('initial_pose_deg', default_value='0.0,50.0,-128.0,38.0,-4.0,0.0'),
+        DeclareLaunchArgument('initial_pose_max_distance', default_value='140.0'),
+        DeclareLaunchArgument('initial_pose_speed', default_value='30'),
         Node(
             package='mycobot_jointstate_controller',
             executable='jointstate_controller_node',
@@ -60,6 +64,10 @@ def generate_launch_description() -> LaunchDescription:
                 'io_timing_outlier_ms': LaunchConfiguration('io_timing_outlier_ms'),
                 'clear_queue_on_send_outlier_ms': LaunchConfiguration('clear_queue_on_send_outlier_ms'),
                 'clear_queue_cooldown_sec': LaunchConfiguration('clear_queue_cooldown_sec'),
+                'move_to_initial_pose': LaunchConfiguration('move_to_initial_pose'),
+                'initial_pose_deg': LaunchConfiguration('initial_pose_deg'),
+                'initial_pose_max_distance': LaunchConfiguration('initial_pose_max_distance'),
+                'initial_pose_speed': LaunchConfiguration('initial_pose_speed'),
             }],
         ),
     ])
